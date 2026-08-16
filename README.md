@@ -19,7 +19,7 @@ Client → nginx → [rl1, rl2, rl3] → Redis (atomic Lua script)
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/distributed-rate-limiter.git
+git clone https://github.com/divyesh20243519/distributed-rate-limiter.git
 cd distributed-rate-limiter
 docker compose -f deploy/docker-compose.yml up --build
 ```
