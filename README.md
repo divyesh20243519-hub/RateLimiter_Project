@@ -2,8 +2,6 @@
 
 A distributed, Redis-backed rate limiter built with FastAPI, implementing the token bucket algorithm with **atomic, race-free** enforcement across multiple stateless server instances.
 
-This project's centerpiece isn't just "a rate limiter" — it's a deliberately reproduced race condition, a proven fix, a live multi-container deployment verifying correctness under real concurrent load, and a measured (and fixed) performance bottleneck. See [Highlights](#highlights) below.
-
 ---
 
 ## Highlights
