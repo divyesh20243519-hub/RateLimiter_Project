@@ -60,4 +60,3 @@ Load tested with Locust (200 concurrent users, 60s) against the full 3-instance 
 | Max latency | 2,200ms | 960ms | −56% |
 | Failures | 0 | 0 | — |
 
-Full writeup: [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md)
