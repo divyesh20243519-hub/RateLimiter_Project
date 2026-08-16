@@ -1,1 +1,205 @@
-# RateLimiter_Project
+# Distributed Rate Limiter
+
+A distributed, Redis-backed rate limiter built with FastAPI, implementing the token bucket algorithm with **atomic, race-free** enforcement across multiple stateless server instances.
+
+This project's centerpiece isn't just "a rate limiter" — it's a deliberately reproduced race condition, a proven fix, a live multi-container deployment verifying correctness under real concurrent load, and a measured (and fixed) performance bottleneck. See [Highlights](#highlights) below.
+
+---
+
+## Highlights
+
+- **Reproduced a real race condition, then fixed it.** A naive GET → calculate → SET implementation against Redis over-allows requests under concurrency (proven with a 20-thread test asserting `allowed_count > 1`). An atomic Lua script (single `EVALSHA` call, executed by Redis single-threaded) closes the race — the identical test then asserts `allowed_count == 1`. See [`app/limiter/naive_redis_bucket.py`](app/limiter/naive_redis_bucket.py) vs [`app/limiter/redis_bucket.py`](app/limiter/redis_bucket.py) and their matching tests.
+- **Proven correct across real separate processes**, not just simulated in a test. Docker Compose runs 3 independent server instances behind nginx (round-robin load balancing); a global `capacity=3` limit holds correctly across all three, because state lives in shared Redis, not in any one process's memory.
+- **Deliberate failure-mode handling.** If Redis becomes unreachable, behavior is explicit and configurable — fail-open (let traffic through, availability over enforcement) or fail-closed (`503`, enforcement over availability) — with a `degraded` flag and header so a fail-open outage is still detectable by monitoring, not silently invisible.
+- **Real observability.** A Prometheus `/metrics` endpoint exposes request outcomes (allowed / rejected / degraded) and Redis call latency — the actual signal you'd wire an alert to.
+- **Found and fixed a real bottleneck under load testing.** A Locust load test surfaced high latency under 200 concurrent users; comparing hot-key vs unique-key latency (nearly identical) ruled out Redis contention as the cause and pointed at FastAPI's sync-route thread pool (default cap: 40 threads). Raising it cut median latency by 38% and served 72% more requests in the same window. Full writeup: [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+- **37 passing tests** across algorithm correctness, HTTP contract, concurrency/race conditions, failure handling, and metrics.
+
+---
+
+## Architecture
+
+```
+                    ┌─────────────┐
+   Client  ───────▶ │    nginx    │  (round-robin load balancer)
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+           ┌─────┐      ┌─────┐      ┌─────┐
+           │ rl1 │      │ rl2 │      │ rl3 │   stateless FastAPI instances
+           └──┬──┘      └──┬──┘      └──┬──┘
+              │            │            │
+              └────────────┼────────────┘
+                            ▼
+                     ┌─────────────┐
+                     │    Redis    │   single source of truth
+                     │ (Lua script │   (atomic token bucket)
+                     │  EVALSHA)   │
+                     └─────────────┘
+```
+
+No instance holds any state. Every request is independently answerable by any instance, because the actual token count lives in Redis, mutated atomically by a Lua script — not in any process's memory.
+
+---
+
+## Quick start
+
+**Requirements:** Docker + Docker Compose.
+
+```bash
+git clone https://github.com/YOUR_USERNAME/distributed-rate-limiter.git
+cd distributed-rate-limiter
+docker compose -f deploy/docker-compose.yml up --build
+```
+
+Then, from another terminal:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/check \
+  -H "Content-Type: application/json" \
+  -d '{"key":"user:123","policy":{"capacity":5,"refill_rate":1}}'
+```
+
+```json
+{"allowed": true, "remaining": 4.0, "retry_after": null}
+```
+
+Hit it 6 times fast with the same key and the 6th response will be a `429`:
+
+```json
+{"allowed": false, "remaining": 0.0, "retry_after": 0.98}
+```
+
+---
+
+## API
+
+### `POST /api/v1/check`
+
+**Request:**
+```json
+{
+  "key": "user:123",
+  "policy": { "capacity": 100, "refill_rate": 1.5 }
+}
+```
+- `key` — the entity being rate-limited (user ID, API key, IP, etc.)
+- `policy.capacity` — max tokens (i.e. max burst size)
+- `policy.refill_rate` — tokens replenished per second
+
+**Response — `200 OK`:**
+```json
+{ "allowed": true, "remaining": 99.0, "retry_after": null }
+```
+Headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`
+
+**Response — `429 Too Many Requests`:**
+```json
+{ "allowed": false, "remaining": 0.0, "retry_after": 1.2 }
+```
+Headers: `Retry-After`
+
+**Response — during a Redis outage** (see [Failure handling](#failure-handling)):
+```json
+{ "allowed": true, "remaining": null, "retry_after": null, "degraded": true }
+```
+Header: `X-RateLimit-Degraded: true`
+
+### `GET /health`
+Liveness check.
+
+### `GET /metrics`
+Prometheus scrape endpoint — `rate_limiter_requests_total{result=...}` and `rate_limiter_redis_call_latency_seconds`.
+
+Interactive API docs (Swagger UI) are auto-generated by FastAPI at `/docs` when running.
+
+---
+
+## Failure handling
+
+Controlled by the `FAIL_MODE` environment variable:
+
+| Mode | Behavior when Redis is unreachable | When to use |
+|---|---|---|
+| `open` (default) | Requests pass through, unenforced (`degraded: true`) | Rate limiter's own downtime shouldn't take your API down with it |
+| `closed` | Requests rejected with `503` | Exceeding budget is worse than some requests failing (e.g. protecting an expensive or compliance-sensitive resource) |
+
+```bash
+FAIL_MODE=closed uvicorn app.main:app
+```
+
+---
+
+## Why Redis + Lua, not just an in-process counter?
+
+Because a naive counter breaks the moment you run more than one server instance — each process would think it has its own private budget, and the real limit could be exceeded by a multiple of however many instances are running. Redis gives every instance one shared source of truth. But naive read-then-write against Redis (`GET` → calculate → `SET`) reintroduces the same race *inside* Redis: two concurrent requests can both read the same token count before either writes back, and both get allowed.
+
+The fix is a single Lua script (`app/limiter/lua/token_bucket.lua`) that performs the entire read-calculate-write sequence as one atomic Redis command. Redis executes Lua scripts single-threaded to completion — no other command on that key can interleave, closing the race entirely. This is proven, not just claimed: `tests/test_naive_redis_bucket.py::test_naive_bucket_has_race_condition` and `tests/test_redis_bucket.py::test_atomic_bucket_fixes_race_condition` run the identical 20-thread concurrency test against each implementation and assert opposite outcomes.
+
+---
+
+## Project structure
+
+```
+app/
+├── main.py                    FastAPI app, lifespan (thread-pool tuning), /health, /metrics
+├── config.py                  Environment-based settings (Redis conn, FAIL_MODE)
+├── policy.py                  Rate-limit policy model + validation
+├── metrics.py                 Prometheus Counter/Histogram definitions
+├── api/
+│   ├── routes.py               POST /api/v1/check
+│   └── schemas.py               Request/response models
+└── limiter/
+    ├── local_bucket.py          In-process token bucket (thread-safe, no Redis)
+    ├── naive_redis_bucket.py    Redis-backed, deliberately racy (teaching artifact)
+    ├── redis_bucket.py          Redis-backed, atomic (production implementation)
+    ├── redis_client.py          Redis connection, exposed as a FastAPI dependency
+    └── lua/token_bucket.lua     The atomic Lua script
+
+tests/                          37 tests across all of the above
+deploy/                          Dockerfile, docker-compose.yml (3 instances + nginx + Redis), nginx.conf
+loadtest/locustfile.py          Locust load test (unique-key + hot-key scenarios)
+benchmarks/RESULTS.md           Measured load test results + bottleneck diagnosis
+```
+
+---
+
+## Running locally (without Docker)
+
+```bash
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+docker run -d -p 6379:6379 redis:7-alpine   # or any local Redis
+uvicorn app.main:app --reload
+```
+
+## Running the tests
+
+```bash
+pytest tests/ -v
+```
+
+37 tests, covering: local bucket correctness and thread-safety, the naive Redis implementation's proven race condition, the atomic implementation's proven fix, the HTTP API contract, multi-instance simulation, Redis failure handling (fail-open/fail-closed), and metrics.
+
+## Running the load test
+
+```bash
+docker compose -f deploy/docker-compose.yml up --build -d
+locust -f loadtest/locustfile.py --headless -u 200 -r 20 -t 60s \
+  --host http://localhost:8080 --csv=benchmarks/results
+```
+
+See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for the full results and the thread-pool bottleneck investigation.
+
+---
+
+## Tech stack
+
+Python · FastAPI · Redis (Lua scripting) · Docker Compose · nginx · Prometheus · Locust · pytest
+
+## License
+
+MIT
