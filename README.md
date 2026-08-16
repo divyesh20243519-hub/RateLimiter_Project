@@ -13,7 +13,7 @@ A Redis-backed, distributed rate limiter built with FastAPI. Implements the toke
 ## Architecture
 
 ```
-Client → nginx → [rl1, rl2, rl3] → Redis (atomic Lua script)
+Client → nginx (load balancing using Round Robin) → [rl1, rl2, rl3] → Redis (atomic Lua script)
 ```
 
 ## Quick start
